@@ -24,13 +24,15 @@ See these for more information:
 import librosa
 from librosa import pyin, load
 import numpy as np
-from scipy.signal import stft
+from scipy.stats import norm
 from pprint import pprint
 
+
 # males are ~80-180Hz (lows at 65); females are 160-280Hz (highs at 1000Hz)
-def compute_pitch(x : np.ndarray, fs: float, time_range) -> float:
+def compute_f0_fingerprint(x : np.ndarray, fs: float, time_range) -> tuple[float, float]:
     """
-    Return min, max, and average pitch of a speaker over a given range.
+    Return a normal distribution representation of the fundamental frequency (in
+    Hz) of a speaker.
     """
     lo, hi = time_range
     start_sample = int(lo * fs)
@@ -50,20 +52,24 @@ def compute_pitch(x : np.ndarray, fs: float, time_range) -> float:
     voiced_f0 = f0[voiced_flag]
     if len(voiced_f0) == 0:
         return 0.0 # no voice detected
+    
+    mu = float(np.mean(voiced_f0))
+    std = float(np.std(voiced_f0))
 
-    return float(np.min(voiced_f0)), float(np.max(voiced_f0)), float(np.mean(voiced_f0))
+    return norm(loc=mu, scale=std)
 
 hector_range = [0.66, 1.92]  # s
 albert_range = [2.70, 3.65]  # s
 x, fs = load("audio/test.wav")
 
-speakers = {
-    "hector": compute_pitch(x, fs, hector_range), # min, max, avg
-    "albert": compute_pitch(x, fs, albert_range)
+speaker_fingerprints = {
+    "hector": compute_f0_fingerprint(x, fs, hector_range), # scipy.stats.norm
+    "albert": compute_f0_fingerprint(x, fs, albert_range),
+    "none": norm(0, 1) # not relevant what this distribution is
 }
-print(f"Speaker freq ranges: {speakers}")
-total_times = {speaker : 0.0 for speaker in speakers.keys()}
-total_times['none'] = 0.0 # track non-speaker time
+speaker_names = speaker_fingerprints.keys()
+print(f"Speaker freq ranges: {speaker_fingerprints}")
+total_times = {speaker : 0.0 for speaker in speaker_names}
 
 # now the next step is to actually break the signal up by when someone's
 # speaking
@@ -82,9 +88,13 @@ f0_track, voiced_flag_track, _ = pyin(
 
 time_granularity = float(512 / fs)
 
-def compare_dominant_pitch(f0_of_frame : float, is_voiced: bool) -> str:
+def select_dominant_speaker(f0_of_frame : float, is_voiced: bool) -> str:
     """
     Compares fundamental freq (F0) of a frame against the speaker's baselines.
+    
+    Does so by computing the probability of observing the measured F0 for each
+    speaker, and selecting the speaker with the highest probability. This is
+    based on the univariate Gaussian modelling the range of F0 for each speaker.
     
     Only works for one speaker at a time!
     """
@@ -92,26 +102,23 @@ def compare_dominant_pitch(f0_of_frame : float, is_voiced: bool) -> str:
         return 'none'
     
     # check belonging to any speaker range
-    distances = {speaker : fs // 2 + 1 for speaker in speakers.keys()} # max f distance
-    for name, (lo, hi, avg) in speakers.items():
-        if lo <= f0_of_frame <= hi:
-            distances[name] = abs(f0_of_frame-avg) # distance from average
+    probs = {speaker: 0.0 for speaker in speaker_names}
+    for name, dist in speaker_fingerprints.items():
+        # compute pdf of f0 val
+        prob = dist.pdf(f0_of_frame)
+        probs[name] = prob
 
-    min_speaker = min(distances, key=distances.get)
-    min_value = distances[min_speaker]
+    max_likelihood_speaker = max(probs, key=probs.get)
+    max_prob = probs[max_likelihood_speaker]
     # final check if there was no near labelled speaker
-    if min_value == fs // 2 + 1:
+    if max_prob == 0.0:
         return 'none'
-    return min_speaker
 
+    return max_likelihood_speaker
 # Classify each segment according to speaker assignment
 print("Starting this heinous loop...")
 for f0_of_frame, is_voiced_frame in zip(f0_track, voiced_flag_track):
-    cur_speaker = compare_dominant_pitch(f0_of_frame, is_voiced_frame)
+    cur_speaker = select_dominant_speaker(f0_of_frame, is_voiced_frame)
     total_times[cur_speaker] += time_granularity
 
 pprint(total_times)
-
-# These are approximately right (when compared to manually labelled lengths of
-# calibration segments). Albert's is dead on, but hector is off by ~.2. I did
-# have a little pause in my speech though, so this is reasonable.
