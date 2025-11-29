@@ -53,7 +53,7 @@ def compute_pitch(x : np.ndarray, fs: float, time_range) -> float:
 
     return float(np.min(voiced_f0)), float(np.max(voiced_f0)), float(np.mean(voiced_f0))
 
-hector_range = [0.64, 1.92]  # s
+hector_range = [0.66, 1.92]  # s
 albert_range = [2.70, 3.65]  # s
 x, fs = load("audio/test.wav")
 
@@ -65,69 +65,53 @@ print(f"Speaker freq ranges: {speakers}")
 total_times = {speaker : 0.0 for speaker in speakers.keys()}
 total_times['none'] = 0.0 # track non-speaker time
 
-
 # now the next step is to actually break the signal up by when someone's
 # speaking
 post_calibration_start = max([*hector_range, *albert_range])
 post_calibration_start_idx = int(post_calibration_start * fs)
-post_calibration_segment = x[post_calibration_start_idx:]
+post_calibration_segment = x[:post_calibration_start_idx]
 
-N, overlap = 512, 256
-time_granularity = (N-overlap) / fs 
-f, t, Zkk = stft(x[post_calibration_start_idx:], fs, "hann", nperseg=N, noverlap=overlap, return_onesided=True)
-assert time_granularity == float(t[1] - t[0]), "your math is wrong"
+f0_track, voiced_flag_track, _ = pyin(
+    y=post_calibration_segment,
+    fmin=librosa.note_to_hz('C2'),
+    fmax=librosa.note_to_hz('C6'),
+    sr=fs,
+    frame_length=2048, # default
+    hop_length=512 # default
+)
 
-# now we need to classify each segment as either having a dominant frequency in
-# one of the two
+time_granularity = float(512 / fs)
 
-def compare_dominant_pitch(segment: np.ndarray) -> str:
+def compare_dominant_pitch(f0_of_frame : float, is_voiced: bool) -> str:
     """
-    CURRENTLY ONLY SUPPORTS ONE SPEAKER AT TIME
+    Compares fundamental freq (F0) of a frame against the speaker's baselines.
     
-    Checks if highest magnitude frequency is in one of the speaker's ranges. If
-    so, it returns the name of the speaker. Else, returns 'none'. 
+    Only works for one speaker at a time!
     """
-    # note, this could be adjusted to top k; but then we also have to deal with
-    # harmonics possibly being second, third, and fourth highest before another
-    # speaker...
-    top_freq_idx = np.argmax(np.abs(segment))
-    top_freq = float(f[top_freq_idx])
-    # check if top_freq in range of any speaker range
+    if not is_voiced:
+        return 'none'
+    
+    # check belonging to any speaker range
     distances = {speaker : fs // 2 + 1 for speaker in speakers.keys()} # max f distance
     for name, (lo, hi, avg) in speakers.items():
-        if lo <= top_freq <= hi:
-            distances[name] = abs(top_freq-avg) # distance from average
-            
+        if lo <= f0_of_frame <= hi:
+            distances[name] = abs(f0_of_frame-avg) # distance from average
+
     min_speaker = min(distances, key=distances.get)
     min_value = distances[min_speaker]
+    # final check if there was no near labelled speaker
     if min_value == fs // 2 + 1:
         return 'none'
     return min_speaker
 
-# I know, this iteration is terribly inefficient. Let's think about how to do
-# this smarter later
-# Zkk : (F, T)
+# Classify each segment according to speaker assignment
 print("Starting this heinous loop...")
-for segment in Zkk.T: # iterate through times
-    # segment: (F,)
-    cur_speaker = compare_dominant_pitch(segment)
+for f0_of_frame, is_voiced_frame in zip(f0_track, voiced_flag_track):
+    cur_speaker = compare_dominant_pitch(f0_of_frame, is_voiced_frame)
     total_times[cur_speaker] += time_granularity
 
 pprint(total_times)
 
-# THIS STFT APPROACH IS FLAWED
-# I'M COMMITTING IT BECAUSE IT'S PART OF THE PROCESS
-# The problem is that the frequency with the highest magnitude is NOT the
-# fundamental frequency. Aside from this approach being inefficient, it's also
-# incorrect. The highest amplitude frequency from speech often turns out to be
-# the 2nd or 3rd harmonic, which will be out of the range of the F0's we
-# identified for each subject.
-
-# To correct for this, we can just use what's already computed with PYIN. PYIN
-# runs along the full duration of the signal, breaking each segment (length 256
-# samples) into a label of its f0 and whether or not that segment is considered
-# 'voiced'. To then check speaker ownership, we can iterate through each segment
-# and assign that segment to the speaker with the min abs distance from f0 of
-# the segment. 
-
-# This is still not great, but will be the subject of my next commit
+# These are approximately right (when compared to manually labelled lengths of
+# calibration segments). Albert's is dead on, but hector is off by ~.2. I did
+# have a little pause in my speech though, so this is reasonable.
